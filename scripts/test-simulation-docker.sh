@@ -586,7 +586,93 @@ test_invalid_scenarios() {
     echo ""
 }
 
+# Function to test workflow coordination across multiple gateways
+test_workflow_coordination() {
+    log_step "Testing multi-gateway workflow coordination..."
 
+    local sender="sales@company-a.local"
+    local recip1="payment-processor@company-b.local"
+    local recip2="integration@partner.local"
+    
+    local COMPOSE_FILE="$PROJECT_ROOT/docker/docker-compose.domain-simulation.yml"
+    local TEST_CLIENT="test-client"
+
+    log_info "Creating sequential workflow across domains from $sender to $recip1 and $recip2"
+    
+    # Send a sequential workflow message
+    local response=$(docker-compose -f "$COMPOSE_FILE" exec -T $TEST_CLIENT curl -s -X POST "http://company-a.local:8080/v1/messages" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "sender": "'"$sender"'",
+            "recipients": ["'"$recip1"'", "'"$recip2"'"],
+            "subject": "Process Order and Ship",
+            "schema": "agntcy:finance.payment.v1",
+            "coordination": {
+                "type": "sequential",
+                "sequence": ["'"$recip1"'", "'"$recip2"'"],
+                "stop_on_failure": true,
+                "timeout": 60
+            },
+            "payload": {"order_id": "ORD-12345", "amount": 100.0, "currency": "USD", "destination": "Beijing"}
+        }')
+        
+    local message_id=$(echo "$response" | jq -r '.message_id // empty')
+    
+    if [ -z "$message_id" ]; then
+        log_error "Failed to create cross-domain sequential workflow. Response: $response"
+        exit 1
+    fi
+    log_info "Sequential Workflow created. ID: $message_id"
+
+    # Wait for processing queues to flush
+    sleep 2
+    
+    # 1. First agent responses via its local domain
+    log_info "payment-processor responding to workflow..."
+    local reply1_response=$(docker-compose -f "$COMPOSE_FILE" exec -T $TEST_CLIENT curl -s -X POST "http://company-b.local:8080/v1/messages" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "sender": "'"$recip1"'",
+            "recipients": ["'"$sender"'"],
+            "subject": "Payment Processed",
+            "schema": "agntcy:finance.payment.v1",
+            "in_reply_to": "'"$message_id"'",
+            "response_type": "workflow_response",
+            "payload": {"payment": "PAY-123", "status": "completed"}
+        }')
+        
+    local reply1_status=$(echo "$reply1_response" | jq -r '.status // empty')
+    if [ "$reply1_status" != "queued" ] && [ "$reply1_status" != "delivered" ]; then
+        log_error "First workflow response failed (expected queued). Response: $reply1_response"
+        exit 1
+    fi
+    log_info "payment-processor response accepted."
+
+    sleep 2 
+
+    # 2. Second agent responds via its own remote domain
+    log_info "integration responding..."
+    local reply2_response=$(docker-compose -f "$COMPOSE_FILE" exec -T $TEST_CLIENT curl -s -X POST "http://partner.local:8080/v1/messages" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "sender": "'"$recip2"'",
+            "recipients": ["'"$sender"'"],
+            "subject": "Order Shipped",
+            "schema": "agntcy:commerce.order.v1",
+            "in_reply_to": "'"$message_id"'",
+            "response_type": "workflow_response",
+            "payload": {"tracking_number": "TRK-987654", "status": "shipped"}
+        }')
+        
+    local reply2_status=$(echo "$reply2_response" | jq -r '.status // empty')
+    if [ "$reply2_status" != "queued" ] && [ "$reply2_status" != "delivered" ]; then
+        log_error "Second workflow response failed (expected queued). Response: $reply2_response"
+        exit 1
+    fi
+    log_info "integration response accepted."
+    
+    log_info "Workflow Coordination tests completed."
+}
 # Main execution
 main() {
     echo "🚀 AMTP Gateway Comprehensive Simulation Test"
@@ -616,6 +702,7 @@ main() {
             test_inbox_retrieval
             test_message_acknowledgment
             test_invalid_scenarios
+            test_workflow_coordination
             log_success "🎉 Comprehensive simulation test completed!"
             log_info "💡 Services are still running. Use '$0 stop' to clean up."
             log_info "💡 Use '$0 logs' to view service logs."
@@ -638,6 +725,7 @@ main() {
         "test-schemas")
             test_schema_validation
             test_invalid_scenarios
+            test_workflow_coordination
             ;;
         "test-discovery")
             test_gateway_capabilities

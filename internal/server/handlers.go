@@ -46,6 +46,8 @@ func generateIdempotencyKey(req *types.SendMessageRequest) string {
 		Coordination *types.CoordinationConfig `json:"coordination"`
 		Headers      map[string]interface{}    `json:"headers"`
 		Payload      json.RawMessage           `json:"payload"`
+		ResponseType string                    `json:"response_type"`
+		InReplyTo    string                    `json:"in_reply_to"`
 		Attachments  []types.Attachment        `json:"attachments"`
 	}{
 		Sender:       req.Sender,
@@ -55,6 +57,8 @@ func generateIdempotencyKey(req *types.SendMessageRequest) string {
 		Coordination: req.Coordination,
 		Headers:      req.Headers,
 		Payload:      req.Payload,
+		ResponseType: req.ResponseType,
+		InReplyTo:    req.InReplyTo,
 		Attachments:  req.Attachments,
 	}
 
@@ -127,6 +131,8 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		Coordination:   req.Coordination,
 		Headers:        req.Headers,
 		Payload:        req.Payload,
+		ResponseType:   req.ResponseType,
+		InReplyTo:      req.InReplyTo,
 		Attachments:    req.Attachments,
 	}
 
@@ -139,9 +145,29 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 		return
 	}
 
+	// Intercept workflow responses
+	if message.ResponseType == "workflow_response" && message.InReplyTo != "" {
+		if s.workflow != nil {
+			err := s.workflow.ProcessResponse(c.Request.Context(), message.InReplyTo, message)
+			if err != nil {
+				// If it's a "not found" error, it means this gateway doesn't own the workflow,
+				// which is perfectly normal for distributed routing. Just ignore and continue routing.
+				if !strings.Contains(err.Error(), "not found") {
+					s.respondWithError(c, http.StatusInternalServerError, "WORKFLOW_UPDATE_FAILED",
+						"Failed to process workflow response", map[string]interface{}{
+							"error": err.Error(),
+						})
+					return
+				}
+			}
+			// If successful or not found, we fall through to let the normal message 
+			// routing/delivery mechanism deliver this response to the recipient.
+		}
+	}
+
 	// Process message using the message processor
 	processingOptions := processing.ProcessingOptions{
-		ImmediatePath: true, // Use immediate path for now
+		ImmediatePath: message.Coordination == nil,
 		Timeout:       30 * time.Second,
 		MaxRetries:    3,
 	}

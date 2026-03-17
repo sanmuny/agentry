@@ -122,6 +122,8 @@ type SendMessageRequest struct {
 	Schema       string                 `json:"schema,omitempty"`
 	Coordination *CoordinationConfig    `json:"coordination,omitempty"`
 	Headers      map[string]interface{} `json:"headers,omitempty"`
+	ResponseType string                 `json:"response_type,omitempty"`
+	InReplyTo    string                 `json:"in_reply_to,omitempty"`
 	Payload      json.RawMessage        `json:"payload,omitempty"`
 	Attachments  []Attachment           `json:"attachments,omitempty"`
 }

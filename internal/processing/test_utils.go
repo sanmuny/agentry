@@ -375,3 +375,23 @@ func createTestMessage() *types.Message {
 		Payload:        json.RawMessage(`{"message": "Hello, World!"}`),
 	}
 }
+
+func (m *MockStorage) StoreWorkflow(ctx context.Context, state *types.WorkflowState) error {
+	return nil
+}
+
+func (m *MockStorage) GetWorkflow(ctx context.Context, workflowID string) (*types.WorkflowState, error) {
+	return nil, nil
+}
+
+func (m *MockStorage) UpdateWorkflowParticipant(ctx context.Context, workflowID string, address string, status types.ParticipantStatus, responsePayload []byte) error {
+	return nil
+}
+
+func (m *MockStorage) UpdateWorkflowStatus(ctx context.Context, workflowID string, status types.WorkflowStatus) error {
+	return nil
+}
+
+func (m *MockStorage) ListTimedOutWorkflows(ctx context.Context) ([]*types.WorkflowState, error) {
+	return nil, nil
+}
