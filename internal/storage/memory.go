@@ -34,6 +34,8 @@ type MemoryStorage struct {
 	agents      map[string]*agents.LocalAgent
 	messagesMux sync.RWMutex
 	statusesMux sync.RWMutex
+	workflows   map[string]*types.Workflow
+	workflowsMux sync.RWMutex
 	agentsMux   sync.RWMutex
 	createdAt   time.Time
 }
@@ -44,6 +46,7 @@ func NewMemoryStorage(config MemoryStorageConfig) *MemoryStorage {
 		config:    config,
 		messages:  make(map[string]*types.Message),
 		statuses:  make(map[string]*types.MessageStatus),
+		workflows:  make(map[string]*types.Workflow),
 		agents:    make(map[string]*agents.LocalAgent),
 		createdAt: time.Now().UTC(),
 	}
