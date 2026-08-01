@@ -40,6 +40,7 @@ type AgentRegistry interface {
 	GetAgent(ctx context.Context, agentAddress string) (*LocalAgent, error)
 	GetAllAgents(ctx context.Context) map[string]*LocalAgent
 	GetSupportedSchemas(ctx context.Context) []string
+	UpdateAgent(ctx context.Context, agentNameOrAddress string, updates *AgentUpdate) (*LocalAgent, error)
 
 	// API key management
 	GenerateAPIKey() (string, error)

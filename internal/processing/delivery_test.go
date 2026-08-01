@@ -130,6 +130,28 @@ func (m *MockAgentRegistry) RotateAPIKey(ctx context.Context, agentAddress strin
 	return newKey, nil
 }
 
+func (m *MockAgentRegistry) UpdateAgent(ctx context.Context, agentNameOrAddress string, updates *agents.AgentUpdate) (*agents.LocalAgent, error) {
+	agent, exists := m.agents[agentNameOrAddress]
+	if !exists {
+		return nil, fmt.Errorf("agent not found: %s", agentNameOrAddress)
+	}
+	if updates.DeliveryMode != nil {
+		agent.DeliveryMode = *updates.DeliveryMode
+	}
+	if updates.PushTarget != nil {
+		agent.PushTarget = *updates.PushTarget
+	}
+	if updates.PushHeaders != nil {
+		agent.Headers = updates.PushHeaders
+	}
+	if updates.SupportedSchemas != nil {
+		agent.SupportedSchemas = updates.SupportedSchemas
+	}
+	agentCopy := *agent
+	agentCopy.APIKey = ""
+	return &agentCopy, nil
+}
+
 func (m *MockAgentRegistry) StoreMessage(recipient string, message *types.Message) error {
 	if m.inbox[recipient] == nil {
 		m.inbox[recipient] = make([]*types.Message, 0)

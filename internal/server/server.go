@@ -319,6 +319,7 @@ func (s *Server) setupRoutes() {
 			// Agent management endpoints
 			admin.POST("/agents", server.withRequestMetrics(func(c *gin.Context) { server.handleRegisterAgent(c) }))
 			admin.DELETE("/agents/:address", server.withRequestMetrics(func(c *gin.Context) { server.handleUnregisterAgent(c) }))
+			admin.PATCH("/agents/:address", server.withRequestMetrics(func(c *gin.Context) { server.handleUpdateAgent(c) }))
 			admin.POST("/agents/:address/rotate-key", server.withRequestMetrics(func(c *gin.Context) { server.handleRotateAgentKey(c) }))
 			admin.GET("/agents", server.withRequestMetrics(func(c *gin.Context) { server.handleListAgents(c) }))
 

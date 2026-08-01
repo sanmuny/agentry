@@ -1684,6 +1684,116 @@ func TestHandleRotateAgentKey_NotFound(t *testing.T) {
 	}
 }
 
+// TestHandleUpdateAgent_Success verifies delivery mode and schemas can be
+// updated on an existing agent.
+func TestHandleUpdateAgent_Success(t *testing.T) {
+	server := createTestServer()
+	ctx := context.Background()
+
+	agent := &agents.LocalAgent{Address: "upd-agent", DeliveryMode: "pull"}
+	if err := server.agentRegistry.RegisterAgent(ctx, agent); err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+
+	body := []byte(`{"delivery_mode":"push","push_target":"https://hooks.example.com/a","supported_schemas":["agntcy:upd.test.v1"]}`)
+	req := httptest.NewRequest("PATCH", "/v1/admin/agents/upd-agent", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var response struct {
+		Message string `json:"message"`
+		Agent   struct {
+			Address          string   `json:"address"`
+			DeliveryMode     string   `json:"delivery_mode"`
+			PushTarget       string   `json:"push_target"`
+			SupportedSchemas []string `json:"supported_schemas"`
+			APIKey           string   `json:"api_key"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if response.Agent.DeliveryMode != "push" {
+		t.Errorf("Expected delivery_mode push, got %s", response.Agent.DeliveryMode)
+	}
+	if response.Agent.PushTarget != "https://hooks.example.com/a" {
+		t.Errorf("Expected push target updated, got %s", response.Agent.PushTarget)
+	}
+	if len(response.Agent.SupportedSchemas) != 1 || response.Agent.SupportedSchemas[0] != "agntcy:upd.test.v1" {
+		t.Errorf("Expected schemas updated, got %v", response.Agent.SupportedSchemas)
+	}
+	if response.Agent.APIKey != "" {
+		t.Error("API key must be redacted in update response")
+	}
+
+	// Verify storage reflects the change.
+	stored, err := server.agentRegistry.GetAgent(ctx, "upd-agent@localhost")
+	if err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if stored.DeliveryMode != "push" {
+		t.Errorf("Expected stored delivery_mode push, got %s", stored.DeliveryMode)
+	}
+}
+
+// TestHandleUpdateAgent_PushWithoutTarget verifies push mode without a
+// target URL is rejected.
+func TestHandleUpdateAgent_PushWithoutTarget(t *testing.T) {
+	server := createTestServer()
+	ctx := context.Background()
+
+	agent := &agents.LocalAgent{Address: "upd-agent2", DeliveryMode: "pull"}
+	if err := server.agentRegistry.RegisterAgent(ctx, agent); err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+
+	body := []byte(`{"delivery_mode":"push"}`)
+	req := httptest.NewRequest("PATCH", "/v1/admin/agents/upd-agent2", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+
+	var errorResponse types.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errorResponse); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if errorResponse.Error.Code != "AGENT_UPDATE_FAILED" {
+		t.Errorf("Expected AGENT_UPDATE_FAILED, got %s", errorResponse.Error.Code)
+	}
+}
+
+// TestHandleUpdateAgent_NotFound verifies updating an unknown agent fails.
+func TestHandleUpdateAgent_NotFound(t *testing.T) {
+	server := createTestServer()
+
+	body := []byte(`{"delivery_mode":"pull"}`)
+	req := httptest.NewRequest("PATCH", "/v1/admin/agents/ghost", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+
+	var errorResponse types.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errorResponse); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if errorResponse.Error.Code != "AGENT_UPDATE_FAILED" {
+		t.Errorf("Expected AGENT_UPDATE_FAILED, got %s", errorResponse.Error.Code)
+	}
+}
+
 // Test inbox handlers
 func TestHandleGetInbox_Success(t *testing.T) {
 	server := createTestServer()

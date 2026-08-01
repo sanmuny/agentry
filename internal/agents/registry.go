@@ -76,6 +76,20 @@ func NewRegistry(config RegistryConfig, storage AgentStore) *Registry {
 	}
 }
 
+// schemaManagerAvailable reports whether the schema manager is usable,
+// guarding against "typed nil" interfaces (a nil *schema.Manager stored in
+// the SchemaManager interface, which is non-nil as an interface value but
+// panics when any method is invoked).
+func (r *Registry) schemaManagerAvailable() bool {
+	if r.schemaManager == nil {
+		return false
+	}
+	if sm, ok := r.schemaManager.(*schema.Manager); ok {
+		return sm != nil
+	}
+	return true
+}
+
 // RegisterAgent registers a local agent with delivery configuration
 func (r *Registry) RegisterAgent(ctx context.Context, agent *LocalAgent) error {
 	if agent.Address == "" {
@@ -177,6 +191,63 @@ func (r *Registry) getAgentInternal(ctx context.Context, agentAddress string) (*
 		return nil, fmt.Errorf("agent not found: %s", agentAddress)
 	}
 	return agent, nil
+}
+
+// UpdateAgent updates mutable delivery configuration for an existing agent.
+// Supported fields: delivery mode, push target, push headers, and supported
+// schemas. The API key is preserved.
+func (r *Registry) UpdateAgent(ctx context.Context, agentNameOrAddress string, updates *AgentUpdate) (*LocalAgent, error) {
+	fullAddress, err := r.normalizeAgentAddress(agentNameOrAddress)
+	if err != nil {
+		return nil, fmt.Errorf("invalid agent identifier: %w", err)
+	}
+
+	agent, err := r.getAgentInternal(ctx, fullAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	if updates.DeliveryMode != nil {
+		if *updates.DeliveryMode != "push" && *updates.DeliveryMode != "pull" {
+			return nil, fmt.Errorf("delivery mode must be 'push' or 'pull'")
+		}
+		agent.DeliveryMode = *updates.DeliveryMode
+	}
+	if updates.PushTarget != nil {
+		agent.PushTarget = *updates.PushTarget
+	}
+	if updates.PushHeaders != nil {
+		agent.Headers = updates.PushHeaders
+	}
+	if updates.SupportedSchemas != nil {
+		if err := r.validateSupportedSchemas(ctx, updates.SupportedSchemas); err != nil {
+			return nil, fmt.Errorf("invalid supported schemas: %w", err)
+		}
+		agent.SupportedSchemas = updates.SupportedSchemas
+		agent.RequiresSchema = len(updates.SupportedSchemas) > 0
+	}
+
+	// Push mode requires a target.
+	if agent.DeliveryMode == "push" && agent.PushTarget == "" {
+		return nil, fmt.Errorf("push target URL is required for push delivery mode")
+	}
+
+	if err := r.storage.UpdateAgent(ctx, agent); err != nil {
+		return nil, fmt.Errorf("failed to update agent: %w", err)
+	}
+
+	// Return a copy with the API key redacted.
+	result := *agent
+	result.APIKey = ""
+	return &result, nil
+}
+
+// AgentUpdate contains optional fields to update on an agent.
+type AgentUpdate struct {
+	DeliveryMode     *string            `json:"delivery_mode,omitempty"`
+	PushTarget       *string            `json:"push_target,omitempty"`
+	PushHeaders      map[string]string  `json:"push_headers,omitempty"`
+	SupportedSchemas []string           `json:"supported_schemas,omitempty"`
 }
 
 // GetAllAgents returns all registered local agents
@@ -334,7 +405,7 @@ func (r *Registry) validateSupportedSchemas(ctx context.Context, schemas []strin
 		}
 
 		// For non-wildcard schemas, check if they exist in the registry
-		if !strings.HasSuffix(schemaStr, "*") && r.schemaManager != nil {
+		if !strings.HasSuffix(schemaStr, "*") && r.schemaManagerAvailable() {
 			schemaID, err := schema.ParseSchemaIdentifier(schemaStr)
 			if err != nil {
 				return fmt.Errorf("invalid schema identifier '%s': %w", schemaStr, err)

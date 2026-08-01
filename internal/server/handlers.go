@@ -868,6 +868,35 @@ func (s *Server) handleRotateAgentKey(c *gin.Context) {
 	})
 }
 
+// handleUpdateAgent handles PATCH /v1/admin/agents/:address
+// Updates mutable delivery configuration for an existing agent.
+func (s *Server) handleUpdateAgent(c *gin.Context) {
+	agentAddress := c.Param("address")
+
+	var updates agents.AgentUpdate
+	if err := c.ShouldBindJSON(&updates); err != nil {
+		s.respondWithError(c, http.StatusBadRequest, "INVALID_REQUEST_FORMAT",
+			"Invalid agent update format", map[string]interface{}{
+				"parse_error": err.Error(),
+			})
+		return
+	}
+
+	updated, err := s.agentRegistry.UpdateAgent(c.Request.Context(), agentAddress, &updates)
+	if err != nil {
+		s.respondWithError(c, http.StatusBadRequest, "AGENT_UPDATE_FAILED",
+			"Failed to update agent", map[string]interface{}{
+				"error": err.Error(),
+			})
+		return
+	}
+
+	s.respondWithSuccess(c, http.StatusOK, gin.H{
+		"message": "Agent updated successfully",
+		"agent":   updated,
+	})
+}
+
 // handleGetInbox handles GET /v1/inbox/:recipient
 func (s *Server) handleGetInbox(c *gin.Context) {
 	recipient := c.Param("recipient")
