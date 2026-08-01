@@ -381,21 +381,74 @@ func (s *Server) handleListMessages(c *gin.Context) {
 		sinceTime = &parsed
 	}
 
-	// For Phase 1, return empty list
-	// In later phases, this would query storage with filters
-	_ = status
-	_ = sender
-	_ = recipient
-	_ = sinceTime
-
-	response := gin.H{
-		"messages": []types.MessageStatus{},
-		"total":    0,
-		"limit":    limit,
-		"offset":   offset,
+	// Build the storage filter.
+	filter := storage.MessageFilter{
+		Sender: sender,
+		Status: types.DeliveryStatus(status),
+		Limit:  limit,
+		Offset: offset,
+	}
+	if recipient != "" {
+		filter.Recipients = []string{recipient}
+	}
+	if sinceTime != nil {
+		unix := sinceTime.Unix()
+		filter.Since = &unix
 	}
 
-	c.JSON(http.StatusOK, response)
+	// Query storage.
+	messages, err := s.storage.ListMessages(c.Request.Context(), filter)
+	if err != nil {
+		s.respondWithError(c, http.StatusInternalServerError, "MESSAGE_LIST_FAILED",
+			"Failed to list messages", map[string]interface{}{
+				"error": err.Error(),
+			})
+		return
+	}
+
+	// Attach delivery status to each message so callers get a complete view.
+	response := make([]gin.H, 0, len(messages))
+	for _, msg := range messages {
+		item := gin.H{
+			"message_id":   msg.MessageID,
+			"idempotency_key": msg.IdempotencyKey,
+			"timestamp":    msg.Timestamp,
+			"sender":       msg.Sender,
+			"recipients":   msg.Recipients,
+			"subject":      msg.Subject,
+			"schema":       msg.Schema,
+			"in_reply_to":  msg.InReplyTo,
+			"response_type": msg.ResponseType,
+			"workflow_id":  msg.WorkflowID,
+		}
+		if msg.Payload != nil {
+			item["payload"] = msg.Payload
+		}
+		if st, err := s.storage.GetStatus(c.Request.Context(), msg.MessageID); err == nil && st != nil {
+			item["status"] = st.Status
+			item["delivery"] = st
+		}
+		response = append(response, item)
+	}
+
+	// total is the number of messages in the filtered set before pagination;
+	// re-run the query without offset/limit is wasteful, so expose count of
+	// the current page plus the filter for the client to paginate.
+	totalFilter := filter
+	totalFilter.Limit = 0
+	totalFilter.Offset = 0
+	totalMessages, err := s.storage.ListMessages(c.Request.Context(), totalFilter)
+	total := 0
+	if err == nil {
+		total = len(totalMessages)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"messages": response,
+		"total":    total,
+		"limit":    limit,
+		"offset":   offset,
+	})
 }
 
 // handleGetCapabilities handles GET /v1/capabilities/:domain

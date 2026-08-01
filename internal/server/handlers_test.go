@@ -1128,6 +1128,79 @@ func TestHandleListMessages_Success(t *testing.T) {
 	}
 }
 
+// TestHandleListMessages_ReturnsStoredMessages verifies the list endpoint
+// surfaces stored messages with their delivery status attached.
+func TestHandleListMessages_ReturnsStoredMessages(t *testing.T) {
+	server := createTestServer()
+	mockStorage := server.storage.(*MockStorage)
+
+	// Seed a message and its status directly into storage.
+	now := time.Now().UTC()
+	msg := &types.Message{
+		Version:        "1.0",
+		MessageID:      "019fbd30-9f27-75aa-8cd4-de1f14e011ab",
+		IdempotencyKey: "11111111-1111-4111-8111-111111111111",
+		Timestamp:      now,
+		Sender:         "sender@localhost",
+		Recipients:     []string{"recipient@localhost"},
+		Subject:        "Hello",
+		Schema:         "agntcy:test.hello.v1",
+		Payload:        json.RawMessage(`{"msg":"hi"}`),
+	}
+	if err := mockStorage.StoreMessage(context.Background(), msg); err != nil {
+		t.Fatalf("seed message: %v", err)
+	}
+	if err := mockStorage.StoreStatus(context.Background(), msg.MessageID, &types.MessageStatus{
+		MessageID: msg.MessageID,
+		Status:    types.StatusDelivered,
+	}); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/v1/messages?limit=10", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var response struct {
+		Messages []map[string]interface{} `json:"messages"`
+		Total    int                      `json:"total"`
+		Limit    int                      `json:"limit"`
+		Offset   int                      `json:"offset"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if response.Total != 1 {
+		t.Errorf("Expected total 1, got %d", response.Total)
+	}
+	if len(response.Messages) != 1 {
+		t.Fatalf("Expected 1 message, got %d", len(response.Messages))
+	}
+
+	got := response.Messages[0]
+	if got["message_id"] != msg.MessageID {
+		t.Errorf("Expected message_id %s, got %v", msg.MessageID, got["message_id"])
+	}
+	if got["subject"] != "Hello" {
+		t.Errorf("Expected subject Hello, got %v", got["subject"])
+	}
+	// Delivery status should be attached.
+	delivery, ok := got["delivery"].(map[string]interface{})
+	if !ok {
+		t.Errorf("Expected delivery status attached, got %v", got["delivery"])
+	} else if delivery["status"] != string(types.StatusDelivered) {
+		t.Errorf("Expected delivery status %s, got %v", types.StatusDelivered, delivery["status"])
+	}
+	if got["status"] != string(types.StatusDelivered) {
+		t.Errorf("Expected status %s, got %v", types.StatusDelivered, got["status"])
+	}
+}
+
 func TestHandleListMessages_WithParameters(t *testing.T) {
 	server := createTestServer()
 
