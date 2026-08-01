@@ -410,16 +410,16 @@ func (s *Server) handleListMessages(c *gin.Context) {
 	response := make([]gin.H, 0, len(messages))
 	for _, msg := range messages {
 		item := gin.H{
-			"message_id":   msg.MessageID,
+			"message_id":      msg.MessageID,
 			"idempotency_key": msg.IdempotencyKey,
-			"timestamp":    msg.Timestamp,
-			"sender":       msg.Sender,
-			"recipients":   msg.Recipients,
-			"subject":      msg.Subject,
-			"schema":       msg.Schema,
-			"in_reply_to":  msg.InReplyTo,
-			"response_type": msg.ResponseType,
-			"workflow_id":  msg.WorkflowID,
+			"timestamp":       msg.Timestamp,
+			"sender":          msg.Sender,
+			"recipients":      msg.Recipients,
+			"subject":         msg.Subject,
+			"schema":          msg.Schema,
+			"in_reply_to":     msg.InReplyTo,
+			"response_type":   msg.ResponseType,
+			"workflow_id":     msg.WorkflowID,
 		}
 		if msg.Payload != nil {
 			item["payload"] = msg.Payload

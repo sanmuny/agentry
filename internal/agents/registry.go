@@ -155,9 +155,9 @@ func (r *Registry) RegisterAgent(ctx context.Context, agent *LocalAgent) error {
 // UnregisterAgent removes a local agent
 func (r *Registry) UnregisterAgent(ctx context.Context, agentNameOrAddress string) error {
 	// Normalize the input to full address
-	fullAddress, err := r.normalizeAgentAddress(agentNameOrAddress)
+	fullAddress, err := r.resolveAgentAddress(agentNameOrAddress)
 	if err != nil {
-		return fmt.Errorf("invalid agent identifier: %w", err)
+		return err
 	}
 
 	err = r.storage.DeleteAgent(ctx, fullAddress)
@@ -197,9 +197,9 @@ func (r *Registry) getAgentInternal(ctx context.Context, agentAddress string) (*
 // Supported fields: delivery mode, push target, push headers, and supported
 // schemas. The API key is preserved.
 func (r *Registry) UpdateAgent(ctx context.Context, agentNameOrAddress string, updates *AgentUpdate) (*LocalAgent, error) {
-	fullAddress, err := r.normalizeAgentAddress(agentNameOrAddress)
+	fullAddress, err := r.resolveAgentAddress(agentNameOrAddress)
 	if err != nil {
-		return nil, fmt.Errorf("invalid agent identifier: %w", err)
+		return nil, err
 	}
 
 	agent, err := r.getAgentInternal(ctx, fullAddress)
@@ -244,10 +244,10 @@ func (r *Registry) UpdateAgent(ctx context.Context, agentNameOrAddress string, u
 
 // AgentUpdate contains optional fields to update on an agent.
 type AgentUpdate struct {
-	DeliveryMode     *string            `json:"delivery_mode,omitempty"`
-	PushTarget       *string            `json:"push_target,omitempty"`
-	PushHeaders      map[string]string  `json:"push_headers,omitempty"`
-	SupportedSchemas []string           `json:"supported_schemas,omitempty"`
+	DeliveryMode     *string           `json:"delivery_mode,omitempty"`
+	PushTarget       *string           `json:"push_target,omitempty"`
+	PushHeaders      map[string]string `json:"push_headers,omitempty"`
+	SupportedSchemas []string          `json:"supported_schemas,omitempty"`
 }
 
 // GetAllAgents returns all registered local agents
@@ -457,6 +457,22 @@ func (r *Registry) validateSchemaFormat(schemaStr string) error {
 	}
 
 	return nil
+}
+
+// resolveAgentAddress accepts either a bare agent name or a full address
+// matching the local domain, and returns the normalized full address.
+// Registration still requires a bare name via normalizeAgentAddress; this
+// helper is used by update/unregister operations that may receive the full
+// address from API clients.
+func (r *Registry) resolveAgentAddress(nameOrAddress string) (string, error) {
+	if strings.Contains(nameOrAddress, "@") {
+		parts := strings.SplitN(nameOrAddress, "@", 2)
+		if parts[1] != r.localDomain {
+			return "", fmt.Errorf("agent address domain %q does not match local domain %q", parts[1], r.localDomain)
+		}
+		nameOrAddress = parts[0]
+	}
+	return r.normalizeAgentAddress(nameOrAddress)
 }
 
 // normalizeAgentAddress processes agent name and constructs full address
