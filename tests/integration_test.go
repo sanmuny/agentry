@@ -23,6 +23,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -34,7 +36,28 @@ import (
 // Integration tests for the AMTP Gateway
 // These tests verify the complete flow from HTTP request to response
 
-func createTestConfig() *config.Config {
+// adminKeyValue is the shared admin key used by the integration tests.
+const adminKeyValue = "integration-admin-key"
+
+// testConfigTB is the subset of testing.TB used by createTestConfig, so the
+// helper works for both tests and benchmarks.
+type testConfigTB interface {
+	Helper()
+	TempDir() string
+	Fatalf(format string, args ...interface{})
+}
+
+// createTestConfig returns a test configuration with a dynamically generated
+// admin key file so the tests work without committing a key to the repo
+// (agentry's .gitignore excludes *.key).
+func createTestConfig(t testConfigTB) *config.Config {
+	t.Helper()
+
+	keyFile := filepath.Join(t.TempDir(), "admin.key")
+	if err := os.WriteFile(keyFile, []byte(adminKeyValue), 0o600); err != nil {
+		t.Fatalf("write admin key file: %v", err)
+	}
+
 	return &config.Config{
 		Server: config.ServerConfig{
 			Address:      ":8080",
@@ -63,9 +86,14 @@ func createTestConfig() *config.Config {
 			ValidationEnabled: true,
 		},
 		Auth: config.AuthConfig{
-			RequireAuth:  false,
-			Methods:      []string{"domain"},
-			APIKeyHeader: "X-API-Key",
+			RequireAuth:       false,
+			Methods:           []string{"domain"},
+			APIKeyHeader:      "X-API-Key",
+			AdminAPIKeyHeader: "X-Admin-Key",
+			// Admin key file used by the message lifecycle test to register
+			// an agent and authenticate message queries.
+			AdminKeyFile: keyFile,
+			APIKeySalt:   "integration-test-salt",
 		},
 		Logging: config.LoggingConfig{
 			Level:  "info",
@@ -75,7 +103,7 @@ func createTestConfig() *config.Config {
 }
 
 func createTestServer(t *testing.T) *httptest.Server {
-	cfg := createTestConfig()
+	cfg := createTestConfig(t)
 
 	srv, err := server.New(cfg)
 	if err != nil {
@@ -99,13 +127,50 @@ func createMockAMTPServer(t *testing.T) *httptest.Server {
 	}))
 }
 
+// registerLocalAgent registers a local agent via the admin API and returns
+// its plaintext API key for authenticating message queries.
+func registerLocalAgent(t *testing.T, baseURL string) string {
+	t.Helper()
+	body := []byte(`{"address":"test","delivery_mode":"pull"}`)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/admin/agents", bytes.NewBuffer(body))
+	if err != nil {
+		t.Fatalf("build register request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-Key", adminKeyValue)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		rb, _ := io.ReadAll(resp.Body)
+		t.Fatalf("register agent status %d: %s", resp.StatusCode, string(rb))
+	}
+
+	var out struct {
+		Agent struct {
+			APIKey string `json:"api_key"`
+		} `json:"agent"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode register response: %v", err)
+	}
+	if out.Agent.APIKey == "" {
+		t.Fatal("agent API key is empty")
+	}
+	return out.Agent.APIKey
+}
+
 func TestIntegration_MessageLifecycle(t *testing.T) {
 	// Create mock AMTP server for deliveries
 	mockAMTPServer := createMockAMTPServer(t)
 	defer mockAMTPServer.Close()
 
 	// Update DNS mock records to point to the mock server
-	cfg := createTestConfig()
+	cfg := createTestConfig(t)
 	cfg.DNS.MockRecords = map[string]string{
 		"test.com":    fmt.Sprintf("v=amtp1;gateway=%s;auth=none;max-size=10485760", mockAMTPServer.URL),
 		"example.com": fmt.Sprintf("v=amtp1;gateway=%s;auth=none;max-size=10485760", mockAMTPServer.URL),
@@ -118,9 +183,12 @@ func TestIntegration_MessageLifecycle(t *testing.T) {
 	testServer := httptest.NewServer(srv.GetRouter())
 	defer testServer.Close()
 
+	// Register a local agent so message queries can authenticate.
+	agentKey := registerLocalAgent(t, testServer.URL)
+
 	// Test 1: Send a message
 	sendRequest := types.SendMessageRequest{
-		Sender:     "test@example.com",
+		Sender:     "test@localhost",
 		Recipients: []string{"recipient@test.com"},
 		Subject:    "Integration Test Message",
 		Payload:    json.RawMessage(`{"message": "Hello from integration test!"}`),
@@ -164,7 +232,12 @@ func TestIntegration_MessageLifecycle(t *testing.T) {
 	messageID := sendResponse.MessageID
 
 	// Test 2: Retrieve the message
-	getResp, err := http.Get(testServer.URL + "/v1/messages/" + messageID)
+	getReq, err := http.NewRequest(http.MethodGet, testServer.URL+"/v1/messages/"+messageID, nil)
+	if err != nil {
+		t.Fatalf("build get request: %v", err)
+	}
+	getReq.Header.Set("Authorization", "Bearer "+agentKey)
+	getResp, err := http.DefaultClient.Do(getReq)
 	if err != nil {
 		t.Fatalf("Failed to get message: %v", err)
 	}
@@ -193,7 +266,12 @@ func TestIntegration_MessageLifecycle(t *testing.T) {
 	}
 
 	// Test 3: Get message status
-	statusResp, err := http.Get(testServer.URL + "/v1/messages/" + messageID + "/status")
+	statusReq, err := http.NewRequest(http.MethodGet, testServer.URL+"/v1/messages/"+messageID+"/status", nil)
+	if err != nil {
+		t.Fatalf("build status request: %v", err)
+	}
+	statusReq.Header.Set("Authorization", "Bearer "+agentKey)
+	statusResp, err := http.DefaultClient.Do(statusReq)
 	if err != nil {
 		t.Fatalf("Failed to get message status: %v", err)
 	}
@@ -228,7 +306,7 @@ func TestIntegration_MultipleRecipients(t *testing.T) {
 	defer mockAMTPServer.Close()
 
 	// Update DNS mock records to point to the mock server
-	cfg := createTestConfig()
+	cfg := createTestConfig(t)
 	cfg.DNS.MockRecords = map[string]string{
 		"test.com":    fmt.Sprintf("v=amtp1;gateway=%s;auth=none;max-size=10485760", mockAMTPServer.URL),
 		"example.com": fmt.Sprintf("v=amtp1;gateway=%s;auth=none;max-size=10485760", mockAMTPServer.URL),
@@ -302,7 +380,7 @@ func TestIntegration_CoordinationTypes(t *testing.T) {
 	defer mockAMTPServer.Close()
 
 	// Update DNS mock records to point to the mock server
-	cfg := createTestConfig()
+	cfg := createTestConfig(t)
 	cfg.DNS.MockRecords = map[string]string{
 		"test.com":    fmt.Sprintf("v=amtp1;gateway=%s;auth=none;max-size=10485760", mockAMTPServer.URL),
 		"example.com": fmt.Sprintf("v=amtp1;gateway=%s;auth=none;max-size=10485760", mockAMTPServer.URL),
@@ -575,6 +653,8 @@ func TestIntegration_InvalidMessageID(t *testing.T) {
 	testServer := createTestServer(t)
 	defer testServer.Close()
 
+	agentKey := registerLocalAgent(t, testServer.URL)
+
 	tests := []struct {
 		name      string
 		messageID string
@@ -588,7 +668,12 @@ func TestIntegration_InvalidMessageID(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			resp, err := http.Get(testServer.URL + test.endpoint)
+			req, err := http.NewRequest(http.MethodGet, testServer.URL+test.endpoint, nil)
+			if err != nil {
+				t.Fatalf("Failed to build request: %v", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+agentKey)
+			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("Failed to get %s: %v", test.endpoint, err)
 			}
@@ -627,7 +712,7 @@ func TestIntegration_Idempotency(t *testing.T) {
 	defer mockAMTPServer.Close()
 
 	// Update DNS mock records to point to the mock server
-	cfg := createTestConfig()
+	cfg := createTestConfig(t)
 	cfg.DNS.MockRecords = map[string]string{
 		"test.com":    fmt.Sprintf("v=amtp1;gateway=%s;auth=none;max-size=10485760", mockAMTPServer.URL),
 		"example.com": fmt.Sprintf("v=amtp1;gateway=%s;auth=none;max-size=10485760", mockAMTPServer.URL),
@@ -691,7 +776,7 @@ func TestIntegration_Idempotency(t *testing.T) {
 
 func BenchmarkIntegration_SendMessage(b *testing.B) {
 	b.Skip("Integration tests temporarily disabled")
-	cfg := createTestConfig()
+	cfg := createTestConfig(b)
 
 	srv, err := server.New(cfg)
 	if err != nil {

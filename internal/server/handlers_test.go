@@ -342,6 +342,17 @@ func createTestServer() *Server {
 	return server
 }
 
+// registerTestAgent registers an agent in the given server and returns its
+// plaintext API key for use in Authorization headers.
+func registerTestAgent(t *testing.T, server *Server, name string) string {
+	t.Helper()
+	agent := &agents.LocalAgent{Address: name, DeliveryMode: "pull"}
+	if err := server.agentRegistry.RegisterAgent(context.Background(), agent); err != nil {
+		t.Fatalf("register test agent %s: %v", name, err)
+	}
+	return agent.APIKey
+}
+
 func TestHandleSendMessage_Success(t *testing.T) {
 	server := createTestServer()
 
@@ -502,6 +513,7 @@ func TestHandleSendMessage_ProcessingFailed(t *testing.T) {
 func TestHandleGetMessage_Success(t *testing.T) {
 	server := createTestServer()
 	mockStorage := server.storage.(*MockStorage)
+	key := registerTestAgent(t, server, "sender")
 
 	// First, send a message to store it
 	message := &types.Message{
@@ -509,7 +521,7 @@ func TestHandleGetMessage_Success(t *testing.T) {
 		MessageID:      "01234567-89ab-7def-8123-456789abcdef",
 		IdempotencyKey: "01234567-89ab-4def-8123-456789abcdef",
 		Timestamp:      time.Now().UTC(),
-		Sender:         "test@example.com",
+		Sender:         "sender@localhost",
 		Recipients:     []string{"recipient@test.com"},
 		Subject:        "Test Message",
 		Payload:        json.RawMessage(`{"message": "Hello, World!"}`),
@@ -520,6 +532,7 @@ func TestHandleGetMessage_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+key)
 
 	rr := httptest.NewRecorder()
 	server.router.ServeHTTP(rr, req)
@@ -545,11 +558,13 @@ func TestHandleGetMessage_Success(t *testing.T) {
 
 func TestHandleGetMessage_InvalidID(t *testing.T) {
 	server := createTestServer()
+	key := registerTestAgent(t, server, "sender")
 
 	req, err := http.NewRequest("GET", "/v1/messages/invalid-id", nil)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+key)
 
 	rr := httptest.NewRecorder()
 	server.router.ServeHTTP(rr, req)
@@ -571,11 +586,13 @@ func TestHandleGetMessage_InvalidID(t *testing.T) {
 
 func TestHandleGetMessage_NotFound(t *testing.T) {
 	server := createTestServer()
+	key := registerTestAgent(t, server, "sender")
 
 	req, err := http.NewRequest("GET", "/v1/messages/01234567-89ab-7def-8123-456789abcdef", nil)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+key)
 
 	rr := httptest.NewRecorder()
 	server.router.ServeHTTP(rr, req)
@@ -595,11 +612,66 @@ func TestHandleGetMessage_NotFound(t *testing.T) {
 	}
 }
 
+func TestHandleGetMessage_ForbiddenOtherAgent(t *testing.T) {
+	server := createTestServer()
+	mockStorage := server.storage.(*MockStorage)
+	// Two agents: the message belongs to agent-a, caller authenticates as agent-b.
+	registerTestAgent(t, server, "agent-a")
+	keyB := registerTestAgent(t, server, "agent-b")
+
+	message := &types.Message{
+		Version:        "1.0",
+		MessageID:      "01234567-89ab-7def-8123-456789abcdef",
+		IdempotencyKey: "01234567-89ab-4def-8123-456789abcdef",
+		Timestamp:      time.Now().UTC(),
+		Sender:         "agent-a@localhost",
+		Recipients:     []string{"other@test.com"},
+		Subject:        "Private",
+	}
+	mockStorage.messages[message.MessageID] = message
+
+	req, err := http.NewRequest("GET", "/v1/messages/"+message.MessageID, nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+keyB)
+
+	rr := httptest.NewRecorder()
+	server.router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("Expected status %d for other agent's message, got %d", http.StatusNotFound, rr.Code)
+	}
+}
+
+func TestHandleGetMessage_NoAuth(t *testing.T) {
+	server := createTestServer()
+
+	req, err := http.NewRequest("GET", "/v1/messages/01234567-89ab-7def-8123-456789abcdef", nil)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	server.router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d without auth, got %d", http.StatusUnauthorized, rr.Code)
+	}
+}
+
 func TestHandleGetMessageStatus_Success(t *testing.T) {
 	server := createTestServer()
 	mockStorage := server.storage.(*MockStorage)
+	key := registerTestAgent(t, server, "sender")
 
 	messageID := "01234567-89ab-7def-8123-456789abcdef"
+	// Message must exist and belong to the caller.
+	mockStorage.messages[messageID] = &types.Message{
+		MessageID:  messageID,
+		Sender:     "sender@localhost",
+		Recipients: []string{"recipient@test.com"},
+	}
 	status := &types.MessageStatus{
 		MessageID: messageID,
 		Status:    types.StatusDelivered,
@@ -621,6 +693,7 @@ func TestHandleGetMessageStatus_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+key)
 
 	rr := httptest.NewRecorder()
 	server.router.ServeHTTP(rr, req)
@@ -650,11 +723,13 @@ func TestHandleGetMessageStatus_Success(t *testing.T) {
 
 func TestHandleGetMessageStatus_InvalidID(t *testing.T) {
 	server := createTestServer()
+	key := registerTestAgent(t, server, "sender")
 
 	req, err := http.NewRequest("GET", "/v1/messages/invalid-id/status", nil)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+key)
 
 	rr := httptest.NewRecorder()
 	server.router.ServeHTTP(rr, req)
@@ -676,11 +751,13 @@ func TestHandleGetMessageStatus_InvalidID(t *testing.T) {
 
 func TestHandleGetMessageStatus_NotFound(t *testing.T) {
 	server := createTestServer()
+	key := registerTestAgent(t, server, "sender")
 
 	req, err := http.NewRequest("GET", "/v1/messages/01234567-89ab-7def-8123-456789abcdef/status", nil)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+key)
 
 	rr := httptest.NewRecorder()
 	server.router.ServeHTTP(rr, req)
@@ -1100,8 +1177,10 @@ func BenchmarkHandleGetMessage(b *testing.B) {
 // Test handleListMessages
 func TestHandleListMessages_Success(t *testing.T) {
 	server := createTestServer()
+	key := registerTestAgent(t, server, "viewer")
 
 	req := httptest.NewRequest("GET", "/v1/messages", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
 	w := httptest.NewRecorder()
 	server.router.ServeHTTP(w, req)
 
@@ -1128,11 +1207,25 @@ func TestHandleListMessages_Success(t *testing.T) {
 	}
 }
 
+// TestHandleListMessages_NoAuth verifies message listing requires a key.
+func TestHandleListMessages_NoAuth(t *testing.T) {
+	server := createTestServer()
+
+	req := httptest.NewRequest("GET", "/v1/messages", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %d without auth, got %d", http.StatusUnauthorized, w.Code)
+	}
+}
+
 // TestHandleListMessages_ReturnsStoredMessages verifies the list endpoint
 // surfaces stored messages with their delivery status attached.
 func TestHandleListMessages_ReturnsStoredMessages(t *testing.T) {
 	server := createTestServer()
 	mockStorage := server.storage.(*MockStorage)
+	key := registerTestAgent(t, server, "sender")
 
 	// Seed a message and its status directly into storage.
 	now := time.Now().UTC()
@@ -1158,6 +1251,7 @@ func TestHandleListMessages_ReturnsStoredMessages(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("GET", "/v1/messages?limit=10", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
 	w := httptest.NewRecorder()
 	server.router.ServeHTTP(w, req)
 
@@ -1203,8 +1297,10 @@ func TestHandleListMessages_ReturnsStoredMessages(t *testing.T) {
 
 func TestHandleListMessages_WithParameters(t *testing.T) {
 	server := createTestServer()
+	key := registerTestAgent(t, server, "viewer")
 
-	req := httptest.NewRequest("GET", "/v1/messages?limit=50&offset=10&status=delivered&sender=test@example.com&recipient=user@example.com&since=2023-01-01T00:00:00Z", nil)
+	req := httptest.NewRequest("GET", "/v1/messages?limit=50&offset=10&status=delivered&sender=viewer@localhost&recipient=viewer@localhost&since=2023-01-01T00:00:00Z", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
 	w := httptest.NewRecorder()
 	server.router.ServeHTTP(w, req)
 
@@ -1227,8 +1323,26 @@ func TestHandleListMessages_WithParameters(t *testing.T) {
 	}
 }
 
+// TestHandleListMessages_ForbiddenOtherAgent verifies filters referencing
+// another agent are rejected.
+func TestHandleListMessages_ForbiddenOtherAgent(t *testing.T) {
+	server := createTestServer()
+	registerTestAgent(t, server, "viewer")
+	key := registerTestAgent(t, server, "other")
+
+	req := httptest.NewRequest("GET", "/v1/messages?sender=viewer@localhost", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("Expected status %d for other agent filter, got %d", http.StatusForbidden, w.Code)
+	}
+}
+
 func TestHandleListMessages_InvalidLimit(t *testing.T) {
 	server := createTestServer()
+	key := registerTestAgent(t, server, "viewer")
 
 	tests := []struct {
 		name  string
@@ -1243,6 +1357,7 @@ func TestHandleListMessages_InvalidLimit(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", "/v1/messages?limit="+tt.limit, nil)
+			req.Header.Set("Authorization", "Bearer "+key)
 			w := httptest.NewRecorder()
 			server.router.ServeHTTP(w, req)
 
@@ -1265,6 +1380,7 @@ func TestHandleListMessages_InvalidLimit(t *testing.T) {
 
 func TestHandleListMessages_InvalidOffset(t *testing.T) {
 	server := createTestServer()
+	key := registerTestAgent(t, server, "viewer")
 
 	tests := []struct {
 		name   string
@@ -1277,6 +1393,7 @@ func TestHandleListMessages_InvalidOffset(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", "/v1/messages?offset="+tt.offset, nil)
+			req.Header.Set("Authorization", "Bearer "+key)
 			w := httptest.NewRecorder()
 			server.router.ServeHTTP(w, req)
 
@@ -1299,8 +1416,10 @@ func TestHandleListMessages_InvalidOffset(t *testing.T) {
 
 func TestHandleListMessages_InvalidSince(t *testing.T) {
 	server := createTestServer()
+	key := registerTestAgent(t, server, "viewer")
 
 	req := httptest.NewRequest("GET", "/v1/messages?since=invalid-date", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
 	w := httptest.NewRecorder()
 	server.router.ServeHTTP(w, req)
 

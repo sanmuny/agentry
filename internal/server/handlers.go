@@ -301,6 +301,8 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 }
 
 // handleGetMessage handles GET /v1/messages/:id
+// Requires an Agent API key; only messages where the authenticated agent is
+// the sender or a recipient are returned.
 func (s *Server) handleGetMessage(c *gin.Context) {
 	messageID := c.Param("id")
 
@@ -308,6 +310,12 @@ func (s *Server) handleGetMessage(c *gin.Context) {
 	if !uuid.IsValidV7(messageID) {
 		s.respondWithError(c, http.StatusBadRequest, "INVALID_MESSAGE_ID",
 			"Invalid message ID format", nil)
+		return
+	}
+
+	// Authenticate the caller as an agent.
+	agentAddr, ok := s.authenticateAgent(c)
+	if !ok {
 		return
 	}
 
@@ -319,10 +327,19 @@ func (s *Server) handleGetMessage(c *gin.Context) {
 		return
 	}
 
+	// Ownership check: caller must be sender or a recipient.
+	if !s.messageBelongsToAgent(message, agentAddr) {
+		s.respondWithError(c, http.StatusNotFound, "MESSAGE_NOT_FOUND",
+			"Message not found", nil)
+		return
+	}
+
 	s.respondWithSuccess(c, http.StatusOK, message)
 }
 
 // handleGetMessageStatus handles GET /v1/messages/:id/status
+// Requires an Agent API key; only messages where the authenticated agent is
+// the sender or a recipient are returned.
 func (s *Server) handleGetMessageStatus(c *gin.Context) {
 	messageID := c.Param("id")
 
@@ -330,6 +347,25 @@ func (s *Server) handleGetMessageStatus(c *gin.Context) {
 	if !uuid.IsValidV7(messageID) {
 		s.respondWithError(c, http.StatusBadRequest, "INVALID_MESSAGE_ID",
 			"Invalid message ID format", nil)
+		return
+	}
+
+	// Authenticate the caller as an agent.
+	agentAddr, ok := s.authenticateAgent(c)
+	if !ok {
+		return
+	}
+
+	// Verify the caller has access to the message before returning status.
+	message, err := s.storage.GetMessage(c.Request.Context(), messageID)
+	if err != nil {
+		s.respondWithError(c, http.StatusNotFound, "MESSAGE_NOT_FOUND",
+			"Message not found", nil)
+		return
+	}
+	if !s.messageBelongsToAgent(message, agentAddr) {
+		s.respondWithError(c, http.StatusNotFound, "MESSAGE_NOT_FOUND",
+			"Message not found", nil)
 		return
 	}
 
@@ -345,7 +381,16 @@ func (s *Server) handleGetMessageStatus(c *gin.Context) {
 }
 
 // handleListMessages handles GET /v1/messages
+// Requires an Agent API key. Results are scoped to the authenticated agent:
+// the sender/recipient filters must reference that agent, and the returned
+// set is always restricted to messages it sent or received.
 func (s *Server) handleListMessages(c *gin.Context) {
+	// Authenticate the caller as an agent.
+	agentAddr, ok := s.authenticateAgent(c)
+	if !ok {
+		return
+	}
+
 	// Parse query parameters
 	status := c.Query("status")
 	sender := c.Query("sender")
@@ -381,34 +426,88 @@ func (s *Server) handleListMessages(c *gin.Context) {
 		sinceTime = &parsed
 	}
 
-	// Build the storage filter.
+	// A caller may only query their own agent's traffic. Reject filters that
+	// reference other agents.
+	if sender != "" && sender != agentAddr {
+		s.respondWithError(c, http.StatusForbidden, "ACCESS_DENIED",
+			"Sender filter must reference the authenticated agent", nil)
+		return
+	}
+	if recipient != "" && recipient != agentAddr {
+		s.respondWithError(c, http.StatusForbidden, "ACCESS_DENIED",
+			"Recipient filter must reference the authenticated agent", nil)
+		return
+	}
+
+	// Build the storage filter scoped to the authenticated agent. The
+	// storage layer applies AND semantics between Sender and Recipients,
+	// so "all traffic for an agent" requires two queries (sent + received)
+	// that are merged and de-duplicated below.
 	filter := storage.MessageFilter{
-		Sender: sender,
 		Status: types.DeliveryStatus(status),
 		Limit:  limit,
 		Offset: offset,
-	}
-	if recipient != "" {
-		filter.Recipients = []string{recipient}
 	}
 	if sinceTime != nil {
 		unix := sinceTime.Unix()
 		filter.Since = &unix
 	}
 
-	// Query storage.
-	messages, err := s.storage.ListMessages(c.Request.Context(), filter)
-	if err != nil {
-		s.respondWithError(c, http.StatusInternalServerError, "MESSAGE_LIST_FAILED",
-			"Failed to list messages", map[string]interface{}{
-				"error": err.Error(),
-			})
-		return
+	var queries []storage.MessageFilter
+	switch {
+	case sender != "" && recipient != "":
+		// Explicit direction: a specific sender AND recipient conversation.
+		q := filter
+		q.Sender = sender
+		q.Recipients = []string{recipient}
+		queries = append(queries, q)
+	case sender != "":
+		q := filter
+		q.Sender = sender
+		queries = append(queries, q)
+	case recipient != "":
+		q := filter
+		q.Recipients = []string{recipient}
+		queries = append(queries, q)
+	default:
+		// No direction: everything the agent sent or received.
+		q1 := filter
+		q1.Sender = agentAddr
+		queries = append(queries, q1)
+		q2 := filter
+		q2.Recipients = []string{agentAddr}
+		queries = append(queries, q2)
+	}
+
+	// Run queries, merging results with de-duplication.
+	seen := make(map[string]struct{})
+	messages := []*types.Message{}
+	for _, q := range queries {
+		page, err := s.storage.ListMessages(c.Request.Context(), q)
+		if err != nil {
+			s.respondWithError(c, http.StatusInternalServerError, "MESSAGE_LIST_FAILED",
+				"Failed to list messages", map[string]interface{}{
+					"error": err.Error(),
+				})
+			return
+		}
+		for _, msg := range page {
+			if _, dup := seen[msg.MessageID]; dup {
+				continue
+			}
+			seen[msg.MessageID] = struct{}{}
+			messages = append(messages, msg)
+		}
 	}
 
 	// Attach delivery status to each message so callers get a complete view.
 	response := make([]gin.H, 0, len(messages))
 	for _, msg := range messages {
+		// Post-filter for safety: the storage filter may be an OR match, so
+		// only include messages the authenticated agent sent or received.
+		if !s.messageBelongsToAgent(msg, agentAddr) {
+			continue
+		}
 		item := gin.H{
 			"message_id":      msg.MessageID,
 			"idempotency_key": msg.IdempotencyKey,
@@ -431,16 +530,30 @@ func (s *Server) handleListMessages(c *gin.Context) {
 		response = append(response, item)
 	}
 
-	// total is the number of messages in the filtered set before pagination;
-	// re-run the query without offset/limit is wasteful, so expose count of
-	// the current page plus the filter for the client to paginate.
-	totalFilter := filter
-	totalFilter.Limit = 0
-	totalFilter.Offset = 0
-	totalMessages, err := s.storage.ListMessages(c.Request.Context(), totalFilter)
+	// total is the number of messages in the filtered set before pagination.
+	// Re-run the queries without limit/offset and count unique matches.
 	total := 0
-	if err == nil {
-		total = len(totalMessages)
+	{
+		totalSeen := make(map[string]struct{})
+		for _, q := range queries {
+			tq := q
+			tq.Limit = 0
+			tq.Offset = 0
+			page, err := s.storage.ListMessages(c.Request.Context(), tq)
+			if err != nil {
+				continue
+			}
+			for _, msg := range page {
+				if !s.messageBelongsToAgent(msg, agentAddr) {
+					continue
+				}
+				if _, dup := totalSeen[msg.MessageID]; dup {
+					continue
+				}
+				totalSeen[msg.MessageID] = struct{}{}
+				total++
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -983,6 +1096,63 @@ func (s *Server) verifyAgentAccess(c *gin.Context, agentAddress string) bool {
 	}
 
 	return true
+}
+
+// authenticateAgent authenticates a request using an Agent API key. On
+// success it returns the agent's full address and true. The key is verified
+// against every registered agent, since the caller does not identify itself
+// in the path for message query endpoints.
+func (s *Server) authenticateAgent(c *gin.Context) (string, bool) {
+	authHeader := c.GetHeader("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		s.respondWithError(c, http.StatusUnauthorized, "MISSING_AUTHORIZATION",
+			"Agent API key required", map[string]interface{}{
+				"required_header": "Authorization: Bearer <api-key>",
+			})
+		return "", false
+	}
+
+	apiKey := strings.TrimPrefix(authHeader, "Bearer ")
+	if apiKey == "" {
+		s.respondWithError(c, http.StatusUnauthorized, "EMPTY_API_KEY",
+			"API key cannot be empty", nil)
+		return "", false
+	}
+
+	// Find the agent that owns this key by scanning the registry. This is
+	// acceptable for the control-plane scale of a gateway; keys are opaque
+	// and salted, so there is no way to look up by key directly.
+	for address, agent := range s.agentRegistry.GetAllAgents(c.Request.Context()) {
+		if agent == nil {
+			continue
+		}
+		// Reuse the inbox verification path which hashes with the same salt.
+		if s.agentRegistry.VerifyAPIKey(c.Request.Context(), address, apiKey) {
+			s.agentRegistry.UpdateLastAccess(c.Request.Context(), address)
+			return address, true
+		}
+	}
+
+	s.respondWithError(c, http.StatusForbidden, "ACCESS_DENIED",
+		"Invalid API key", nil)
+	return "", false
+}
+
+// messageBelongsToAgent reports whether the message was sent by or addressed
+// to the given agent address.
+func (s *Server) messageBelongsToAgent(message *types.Message, agentAddr string) bool {
+	if message == nil {
+		return false
+	}
+	if message.Sender == agentAddr {
+		return true
+	}
+	for _, r := range message.Recipients {
+		if r == agentAddr {
+			return true
+		}
+	}
+	return false
 }
 
 // handleDiscoverAgents handles GET /v1/discovery/agents
