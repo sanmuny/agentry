@@ -838,6 +838,36 @@ func (s *Server) handleListAgents(c *gin.Context) {
 	})
 }
 
+// handleRotateAgentKey handles POST /v1/admin/agents/:address/rotate-key
+// Generates a new API key for the agent and returns it in plaintext so the
+// caller can store it securely. The old key becomes invalid immediately.
+func (s *Server) handleRotateAgentKey(c *gin.Context) {
+	agentAddress := c.Param("address")
+
+	// Normalize a bare agent name to a full address (name@domain) before
+	// consulting the registry, matching how registration stores agents.
+	fullAddress := agentAddress
+	if !strings.Contains(agentAddress, "@") && s.config.Server.Domain != "" {
+		fullAddress = agentAddress + "@" + s.config.Server.Domain
+	}
+
+	newKey, err := s.agentRegistry.RotateAPIKey(c.Request.Context(), fullAddress)
+	if err != nil {
+		s.respondWithError(c, http.StatusBadRequest, "AGENT_KEY_ROTATION_FAILED",
+			"Failed to rotate agent API key", map[string]interface{}{
+				"error": err.Error(),
+			})
+		return
+	}
+
+	s.respondWithSuccess(c, http.StatusOK, gin.H{
+		"message":   "Agent API key rotated successfully",
+		"address":   fullAddress,
+		"api_key":   newKey,
+		"timestamp": time.Now().UTC(),
+	})
+}
+
 // handleGetInbox handles GET /v1/inbox/:recipient
 func (s *Server) handleGetInbox(c *gin.Context) {
 	recipient := c.Param("recipient")

@@ -1614,6 +1614,76 @@ func TestHandleListAgents_Success(t *testing.T) {
 	}
 }
 
+// TestHandleRotateAgentKey_Success verifies a new key is issued and the
+// old key no longer authenticates.
+func TestHandleRotateAgentKey_Success(t *testing.T) {
+	server := createTestServer()
+	ctx := context.Background()
+
+	// Register an agent and capture the original API key.
+	agent := &agents.LocalAgent{Address: "rotate-me", DeliveryMode: "pull"}
+	if err := server.agentRegistry.RegisterAgent(ctx, agent); err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+	oldKey := agent.APIKey
+
+	req := httptest.NewRequest("POST", "/v1/admin/agents/rotate-me/rotate-key", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var response struct {
+		Message string `json:"message"`
+		Address string `json:"address"`
+		APIKey  string `json:"api_key"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if response.APIKey == "" {
+		t.Fatal("Expected a new api_key in the response")
+	}
+	if response.APIKey == oldKey {
+		t.Error("Expected the new key to differ from the old key")
+	}
+	if response.Address != "rotate-me@localhost" {
+		t.Errorf("Expected normalized address rotate-me@localhost, got %s", response.Address)
+	}
+
+	// Old key must no longer verify.
+	if server.agentRegistry.VerifyAPIKey(ctx, "rotate-me@localhost", oldKey) {
+		t.Error("Old API key should be invalid after rotation")
+	}
+	// New key must verify.
+	if !server.agentRegistry.VerifyAPIKey(ctx, "rotate-me@localhost", response.APIKey) {
+		t.Error("New API key should verify after rotation")
+	}
+}
+
+// TestHandleRotateAgentKey_NotFound verifies rotation fails for unknown agents.
+func TestHandleRotateAgentKey_NotFound(t *testing.T) {
+	server := createTestServer()
+
+	req := httptest.NewRequest("POST", "/v1/admin/agents/nonexistent/rotate-key", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+
+	var errorResponse types.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errorResponse); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if errorResponse.Error.Code != "AGENT_KEY_ROTATION_FAILED" {
+		t.Errorf("Expected AGENT_KEY_ROTATION_FAILED, got %s", errorResponse.Error.Code)
+	}
+}
+
 // Test inbox handlers
 func TestHandleGetInbox_Success(t *testing.T) {
 	server := createTestServer()
