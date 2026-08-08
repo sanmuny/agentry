@@ -246,6 +246,81 @@ func TestListMessages_WithFilters(t *testing.T) {
 	}
 }
 
+// TestListMessages_OrFilter verifies that an OR-mode filter generates a
+// single SQL clause covering "sent by OR addressed to", so that Limit/Offset
+// apply to the merged result set (the merged-query pagination fix).
+func TestListMessages_OrFilter(t *testing.T) {
+	gormDB, mock := newMockDB(t)
+	sqlDB, _ := gormDB.DB()
+	defer sqlDB.Close()
+	storage := &DatabaseStorage{db: gormDB}
+
+	filter := MessageFilter{
+		Sender:     "agent@localhost",
+		Recipients: []string{"agent@localhost"},
+		Or:         true,
+		Offset:     2,
+		Limit:      3,
+	}
+	recipientsJSON := `["agent@localhost"]`
+	// Without a JOIN, GORM selects *; the raw OR expression is emitted
+	// as a single WHERE clause covering both directions.
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "messages" WHERE sender = $1 OR recipients @> $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4`)).WithArgs(
+		filter.Sender,
+		recipientsJSON,
+		filter.Limit,
+		filter.Offset,
+	).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	msgs, err := storage.ListMessages(context.Background(), filter)
+	if err != nil {
+		t.Errorf("ListMessages with OR filter failed: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("expected empty result, got: %v", msgs)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations: %v", err)
+	}
+}
+
+// TestListMessages_OrFilterSingleSide verifies that an OR-mode filter with
+// only one side set falls back to the single-predicate clauses.
+func TestListMessages_OrFilterSingleSide(t *testing.T) {
+	gormDB, mock := newMockDB(t)
+	sqlDB, _ := gormDB.DB()
+	defer sqlDB.Close()
+	storage := &DatabaseStorage{db: gormDB}
+
+	// OR with only a sender behaves like a plain sender query.
+	filter := MessageFilter{Sender: "agent@localhost", Or: true, Limit: 10}
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "messages" WHERE sender = $1 ORDER BY created_at DESC LIMIT $2`)).WithArgs(
+		filter.Sender,
+		filter.Limit,
+	).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	if _, err := storage.ListMessages(context.Background(), filter); err != nil {
+		t.Errorf("ListMessages with OR sender filter failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations: %v", err)
+	}
+
+	// OR with only recipients behaves like a plain recipients query.
+	filter = MessageFilter{Recipients: []string{"agent@localhost"}, Or: true, Limit: 10}
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "messages" WHERE recipients @> $1 ORDER BY created_at DESC LIMIT $2`)).WithArgs(
+		`["agent@localhost"]`,
+		filter.Limit,
+	).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+
+	if _, err := storage.ListMessages(context.Background(), filter); err != nil {
+		t.Errorf("ListMessages with OR recipients filter failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unfulfilled expectations: %v", err)
+	}
+}
+
 func TestStoreStatus_NilStatus(t *testing.T) {
 	gormDB, _ := newMockDB(t)
 	sqlDB, _ := gormDB.DB()

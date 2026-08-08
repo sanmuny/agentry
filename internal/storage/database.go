@@ -195,18 +195,29 @@ func (ds *DatabaseStorage) DeleteMessage(ctx context.Context, messageID string) 
 func (ds *DatabaseStorage) ListMessages(ctx context.Context, filter MessageFilter) ([]*types.Message, error) {
 	query := ds.db.WithContext(ctx).Model(&Message{})
 
-	// Apply filters
-	if filter.Sender != "" {
-		query = query.Where("sender = ?", filter.Sender)
-	}
-
-	if len(filter.Recipients) > 0 {
-		// Use JSONB containment operator to check if recipients array contains any of the filter recipients
+	// Apply sender/recipient filters. They are ANDed by default; when
+	// filter.Or is set with both sides present, a single clause matches
+	// "sent by OR addressed to" so that pagination applies to the merged
+	// result set.
+	if filter.Or && filter.Sender != "" && len(filter.Recipients) > 0 {
 		recipientsJSON, err := json.Marshal(filter.Recipients)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal recipients filter: %w", err)
 		}
-		query = query.Where("recipients @> ?", string(recipientsJSON))
+		query = query.Where("sender = ? OR recipients @> ?", filter.Sender, string(recipientsJSON))
+	} else {
+		if filter.Sender != "" {
+			query = query.Where("sender = ?", filter.Sender)
+		}
+
+		if len(filter.Recipients) > 0 {
+			// Use JSONB containment operator to check if recipients array contains any of the filter recipients
+			recipientsJSON, err := json.Marshal(filter.Recipients)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal recipients filter: %w", err)
+			}
+			query = query.Where("recipients @> ?", string(recipientsJSON))
+		}
 	}
 
 	if filter.Status != "" {

@@ -52,6 +52,9 @@ type MockStorage struct {
 	messages map[string]*types.Message
 	statuses map[string]*types.MessageStatus
 	agents   map[string]*agents.LocalAgent
+	// listFilters records every filter passed to ListMessages so handler
+	// tests can assert the shape of the underlying storage query.
+	listFilters []storage.MessageFilter
 }
 
 func NewMockMessageProcessor() *MockMessageProcessor {
@@ -88,6 +91,7 @@ func (m *MockStorage) DeleteMessage(ctx context.Context, messageID string) error
 }
 
 func (m *MockStorage) ListMessages(ctx context.Context, filter storage.MessageFilter) ([]*types.Message, error) {
+	m.listFilters = append(m.listFilters, filter)
 	var messages []*types.Message
 	for _, msg := range m.messages {
 		messages = append(messages, msg)
@@ -1435,6 +1439,205 @@ func TestHandleListMessages_InvalidSince(t *testing.T) {
 
 	if errorResponse.Error.Code != "INVALID_SINCE_FORMAT" {
 		t.Errorf("Expected error code 'INVALID_SINCE_FORMAT', got %s", errorResponse.Error.Code)
+	}
+}
+
+// TestHandleListMessages_MergedQueryUsesOrFilter verifies that the default
+// "all traffic" path (no sender/recipient filter) issues exactly one
+// OR-mode storage query covering both directions, with limit/offset intact,
+// instead of two independently paginated queries.
+func TestHandleListMessages_MergedQueryUsesOrFilter(t *testing.T) {
+	server := createTestServer()
+	mockStorage := server.storage.(*MockStorage)
+	key := registerTestAgent(t, server, "viewer")
+
+	now := time.Now().UTC()
+	if err := mockStorage.StoreMessage(context.Background(), &types.Message{
+		MessageID:  "019fbd30-0001-75aa-8cd4-de1f14e011ab",
+		Timestamp:  now,
+		Sender:     "viewer@localhost",
+		Recipients: []string{"peer@localhost"},
+		Subject:    "sent",
+	}); err != nil {
+		t.Fatalf("seed sent message: %v", err)
+	}
+	if err := mockStorage.StoreMessage(context.Background(), &types.Message{
+		MessageID:  "019fbd30-0002-75aa-8cd4-de1f14e011ab",
+		Timestamp:  now.Add(-time.Minute),
+		Sender:     "peer@localhost",
+		Recipients: []string{"viewer@localhost"},
+		Subject:    "received",
+	}); err != nil {
+		t.Fatalf("seed received message: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/v1/messages?limit=5&offset=2", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	// The merged path must issue an OR-mode query for the page plus a second
+	// OR-mode query for the total count, so limit/offset apply to the merged,
+	// newest-first result set rather than to each direction independently.
+	if len(mockStorage.listFilters) != 2 {
+		t.Fatalf("Expected 2 storage queries (page + total) for the merged path, got %d", len(mockStorage.listFilters))
+	}
+	filter := mockStorage.listFilters[0]
+	if !filter.Or {
+		t.Error("Expected the merged query to use OR semantics")
+	}
+	if filter.Sender != "viewer@localhost" {
+		t.Errorf("Expected merged query sender viewer@localhost, got %q", filter.Sender)
+	}
+	if len(filter.Recipients) != 1 || filter.Recipients[0] != "viewer@localhost" {
+		t.Errorf("Expected merged query recipients [viewer@localhost], got %v", filter.Recipients)
+	}
+	if filter.Limit != 5 {
+		t.Errorf("Expected limit 5 propagated to storage, got %d", filter.Limit)
+	}
+	if filter.Offset != 2 {
+		t.Errorf("Expected offset 2 propagated to storage, got %d", filter.Offset)
+	}
+
+	// The total-count query must keep OR semantics but drop pagination.
+	totalFilter := mockStorage.listFilters[1]
+	if !totalFilter.Or {
+		t.Error("Expected the total-count query to keep OR semantics")
+	}
+	if totalFilter.Limit != 0 || totalFilter.Offset != 0 {
+		t.Errorf("Expected unpaginated total query, got limit=%d offset=%d", totalFilter.Limit, totalFilter.Offset)
+	}
+
+	// Both directions must be surfaced in the response.
+	var response struct {
+		Messages []map[string]interface{} `json:"messages"`
+		Total    int                      `json:"total"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if response.Total != 2 {
+		t.Errorf("Expected total 2, got %d", response.Total)
+	}
+	if len(response.Messages) != 2 {
+		t.Fatalf("Expected 2 messages, got %d", len(response.Messages))
+	}
+	subjects := map[string]bool{}
+	for _, m := range response.Messages {
+		subjects[m["subject"].(string)] = true
+	}
+	if !subjects["sent"] || !subjects["received"] {
+		t.Errorf("Expected both sent and received messages in the merged result, got %v", subjects)
+	}
+}
+
+// TestHandleListMessages_MergedQueryPagination runs the merged "all traffic"
+// path against real storage and verifies that limit/offset apply to the
+// merged, newest-first result set: pages never exceed limit, consecutive
+// pages neither overlap nor drop messages, and the ordering is globally
+// newest-first.
+func TestHandleListMessages_MergedQueryPagination(t *testing.T) {
+	server := createTestServerWithRealProcessor()
+	key := registerTestAgent(t, server, "viewer")
+
+	ctx := context.Background()
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	const total = 8
+	// Newest-first expected order; even indices are sent by the viewer, odd
+	// indices are received by it.
+	newestFirst := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		sender, recipient := "viewer@localhost", "peer@localhost"
+		if i%2 == 1 {
+			sender, recipient = "peer@localhost", "viewer@localhost"
+		}
+		msgID := fmt.Sprintf("019fbd30-%04d-75aa-8cd4-de1f14e011ab", i)
+		msg := &types.Message{
+			Version:        "1.0",
+			MessageID:      msgID,
+			IdempotencyKey: "11111111-1111-4111-8111-111111111111",
+			Timestamp:      base.Add(time.Duration(total-1-i) * time.Minute),
+			Sender:         sender,
+			Recipients:     []string{recipient},
+			Subject:        fmt.Sprintf("merged-%d", i),
+			Payload:        json.RawMessage(`{"i":` + fmt.Sprintf("%d", i) + `}`),
+		}
+		if err := server.storage.StoreMessage(ctx, msg); err != nil {
+			t.Fatalf("seed %s: %v", msgID, err)
+		}
+		newestFirst = append(newestFirst, msgID)
+	}
+
+	// Page through the full set with limit=3.
+	const limit = 3
+	seen := make(map[string]struct{})
+	var all []string
+	for offset := 0; offset < total; offset += limit {
+		req := httptest.NewRequest("GET", fmt.Sprintf("/v1/messages?limit=%d&offset=%d", limit, offset), nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		w := httptest.NewRecorder()
+		server.router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("offset=%d: expected status %d, got %d: %s", offset, http.StatusOK, w.Code, w.Body.String())
+		}
+
+		var response struct {
+			Messages []struct {
+				MessageID string `json:"message_id"`
+				Timestamp string `json:"timestamp"`
+			} `json:"messages"`
+			Total  int `json:"total"`
+			Limit  int `json:"limit"`
+			Offset int `json:"offset"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+			t.Fatalf("offset=%d: unmarshal: %v", offset, err)
+		}
+
+		if response.Total != total {
+			t.Errorf("offset=%d: expected total %d, got %d", offset, total, response.Total)
+		}
+		if len(response.Messages) > limit {
+			t.Errorf("offset=%d: expected at most %d messages, got %d", offset, limit, len(response.Messages))
+		}
+
+		// Newest-first within the page.
+		for j := 1; j < len(response.Messages); j++ {
+			prev, err := time.Parse(time.RFC3339, response.Messages[j-1].Timestamp)
+			if err != nil {
+				t.Fatalf("offset=%d: parse previous timestamp: %v", offset, err)
+			}
+			cur, err := time.Parse(time.RFC3339, response.Messages[j].Timestamp)
+			if err != nil {
+				t.Fatalf("offset=%d: parse current timestamp: %v", offset, err)
+			}
+			if !prev.After(cur) {
+				t.Errorf("offset=%d: page not newest-first: %s before %s",
+					offset, response.Messages[j-1].MessageID, response.Messages[j].MessageID)
+			}
+		}
+
+		for _, m := range response.Messages {
+			if _, dup := seen[m.MessageID]; dup {
+				t.Errorf("offset=%d: duplicate message %s across pages", offset, m.MessageID)
+			}
+			seen[m.MessageID] = struct{}{}
+			all = append(all, m.MessageID)
+		}
+	}
+
+	if len(all) != total {
+		t.Errorf("Expected %d messages across pages, got %d", total, len(all))
+	}
+	for i, id := range newestFirst {
+		if i < len(all) && all[i] != id {
+			t.Errorf("Position %d: expected %s, got %s (merged list must be newest-first)", i, id, all[i])
+		}
 	}
 }
 

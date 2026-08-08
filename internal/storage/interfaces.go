@@ -80,6 +80,7 @@ type MessageFilter struct {
 	Since      *int64 // Unix timestamp
 	Limit      int
 	Offset     int
+	Or         bool
 }
 
 // StatusUpdater is a function that updates message status

@@ -127,11 +127,15 @@ func createMockAMTPServer(t *testing.T) *httptest.Server {
 	}))
 }
 
-// registerLocalAgent registers a local agent via the admin API and returns
-// its plaintext API key for authenticating message queries.
-func registerLocalAgent(t *testing.T, baseURL string) string {
+// registerLocalAgentWithAddress registers a local agent with the given
+// address via the admin API and returns its plaintext API key for
+// authenticating message queries.
+func registerLocalAgentWithAddress(t *testing.T, baseURL, address string) string {
 	t.Helper()
-	body := []byte(`{"address":"test","delivery_mode":"pull"}`)
+	body, err := json.Marshal(map[string]string{"address": address, "delivery_mode": "pull"})
+	if err != nil {
+		t.Fatalf("marshal register request: %v", err)
+	}
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/admin/agents", bytes.NewBuffer(body))
 	if err != nil {
 		t.Fatalf("build register request: %v", err)
@@ -162,6 +166,203 @@ func registerLocalAgent(t *testing.T, baseURL string) string {
 		t.Fatal("agent API key is empty")
 	}
 	return out.Agent.APIKey
+}
+
+// registerLocalAgent registers a local agent named "test" via the admin API
+// and returns its plaintext API key for authenticating message queries.
+func registerLocalAgent(t *testing.T, baseURL string) string {
+	t.Helper()
+	return registerLocalAgentWithAddress(t, baseURL, "test")
+}
+
+// sendTestMessage posts a message via the send endpoint and returns the
+// assigned message ID. An explicit timestamp makes the newest-first ordering
+// of the message store deterministic for pagination assertions.
+func sendTestMessage(t *testing.T, baseURL, sender, recipient, subject, timestamp string) string {
+	t.Helper()
+	sendRequest := types.SendMessageRequest{
+		Sender:     sender,
+		Recipients: []string{recipient},
+		Subject:    subject,
+		Timestamp:  timestamp,
+		Payload:    json.RawMessage(`{"hello":"world"}`),
+	}
+	body, err := json.Marshal(sendRequest)
+	if err != nil {
+		t.Fatalf("marshal send request: %v", err)
+	}
+	resp, err := http.Post(baseURL+"/v1/messages", "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		t.Fatalf("send message: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		rb, _ := io.ReadAll(resp.Body)
+		t.Fatalf("send message status %d: %s", resp.StatusCode, string(rb))
+	}
+
+	var sendResponse types.SendMessageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sendResponse); err != nil {
+		t.Fatalf("decode send response: %v", err)
+	}
+	if sendResponse.MessageID == "" {
+		t.Fatal("send response has empty message ID")
+	}
+	return sendResponse.MessageID
+}
+
+// listMessageItem is the per-message shape returned by GET /v1/messages.
+type listMessageItem struct {
+	MessageID string `json:"message_id"`
+	Timestamp string `json:"timestamp"`
+}
+
+// listMessagesResponse is the envelope returned by GET /v1/messages.
+type listMessagesResponse struct {
+	Messages []listMessageItem `json:"messages"`
+	Total    int               `json:"total"`
+	Limit    int               `json:"limit"`
+	Offset   int               `json:"offset"`
+}
+
+// listMessages queries GET /v1/messages as the given agent and returns the
+// parsed response.
+func listMessages(t *testing.T, baseURL, apiKey string, limit, offset int) listMessagesResponse {
+	t.Helper()
+	url := fmt.Sprintf("%s/v1/messages?limit=%d&offset=%d", baseURL, limit, offset)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("build list request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		rb, _ := io.ReadAll(resp.Body)
+		t.Fatalf("list messages status %d: %s", resp.StatusCode, string(rb))
+	}
+
+	var out listMessagesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	return out
+}
+
+// TestIntegration_ListMessagesPagination is a functional verification test
+// for the merged "all traffic" message query (GET /v1/messages without a
+// sender/recipient filter). It seeds a mix of messages the listing agent
+// sent and messages it received, then pages through the result and verifies:
+//   - each page holds at most `limit` messages,
+//   - consecutive pages neither overlap nor drop messages,
+//   - the merged list is sorted newest-first, and
+//   - total reflects the full filtered set.
+func TestIntegration_ListMessagesPagination(t *testing.T) {
+	testServer := createTestServer(t)
+	defer testServer.Close()
+
+	// Listing agent plus a peer so the agent has both sent and received
+	// traffic.
+	agentKey := registerLocalAgent(t, testServer.URL)
+	registerLocalAgentWithAddress(t, testServer.URL, "peer")
+
+	// Seed messages with strictly decreasing timestamps so the expected
+	// newest-first order is deterministic. Even indices are sent by the
+	// listing agent, odd indices are received by it (sent by the peer);
+	// interleaving both directions exposes any sent-then-received merge
+	// ordering bug.
+	const total = 8
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	newestFirst := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		ts := base.Add(time.Duration(total-1-i) * time.Minute).Format(time.RFC3339)
+		sender, recipient := "test@localhost", "peer@localhost"
+		if i%2 == 1 {
+			sender, recipient = "peer@localhost", "test@localhost"
+		}
+		msgID := sendTestMessage(t, testServer.URL, sender, recipient,
+			fmt.Sprintf("pagination-%d", i), ts)
+		newestFirst = append(newestFirst, msgID)
+	}
+
+	// Page through the full set with limit=3 and verify stability across
+	// offsets.
+	const limit = 3
+	seen := make(map[string]bool)
+	var all []string
+	for offset := 0; offset < total; offset += limit {
+		resp := listMessages(t, testServer.URL, agentKey, limit, offset)
+
+		if resp.Total != total {
+			t.Errorf("offset=%d: expected total %d, got %d", offset, total, resp.Total)
+		}
+		if resp.Offset != offset {
+			t.Errorf("offset=%d: expected echoed offset %d", offset, resp.Offset)
+		}
+		if resp.Limit != limit {
+			t.Errorf("offset=%d: expected echoed limit %d", offset, resp.Limit)
+		}
+		if len(resp.Messages) > limit {
+			t.Errorf("offset=%d: expected at most %d messages, got %d",
+				offset, limit, len(resp.Messages))
+		}
+
+		// Each page must be ordered newest-first.
+		for j := 1; j < len(resp.Messages); j++ {
+			prev, err := time.Parse(time.RFC3339, resp.Messages[j-1].Timestamp)
+			if err != nil {
+				t.Fatalf("parse previous timestamp %q: %v", resp.Messages[j-1].Timestamp, err)
+			}
+			cur, err := time.Parse(time.RFC3339, resp.Messages[j].Timestamp)
+			if err != nil {
+				t.Fatalf("parse current timestamp %q: %v", resp.Messages[j].Timestamp, err)
+			}
+			if !prev.After(cur) {
+				t.Errorf("offset=%d: messages not newest-first: %s (%s) before %s (%s)",
+					offset, resp.Messages[j-1].MessageID, prev, resp.Messages[j].MessageID, cur)
+			}
+		}
+
+		for _, m := range resp.Messages {
+			if seen[m.MessageID] {
+				t.Errorf("offset=%d: duplicate message %s across pages", offset, m.MessageID)
+			}
+			seen[m.MessageID] = true
+			all = append(all, m.MessageID)
+		}
+	}
+
+	// The union of all pages must cover every seeded message exactly once,
+	// in newest-first order.
+	if len(all) != total {
+		t.Errorf("expected %d messages across pages, got %d", total, len(all))
+	}
+	for i, id := range newestFirst {
+		if i < len(all) && all[i] != id {
+			t.Errorf("position %d: expected %s, got %s (merged list must be newest-first)",
+				i, id, all[i])
+		}
+	}
+
+	// An unpaginated listing returns everything, newest-first.
+	resp := listMessages(t, testServer.URL, agentKey, 100, 0)
+	if resp.Total != total {
+		t.Errorf("expected total %d, got %d", total, resp.Total)
+	}
+	if len(resp.Messages) != total {
+		t.Errorf("expected %d messages, got %d", total, len(resp.Messages))
+	}
+	for i, id := range newestFirst {
+		if i < len(resp.Messages) && resp.Messages[i].MessageID != id {
+			t.Errorf("unpaginated position %d: expected %s, got %s",
+				i, id, resp.Messages[i].MessageID)
+		}
+	}
 }
 
 func TestIntegration_MessageLifecycle(t *testing.T) {

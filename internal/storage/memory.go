@@ -349,28 +349,40 @@ func (ms *MemoryStorage) GetStats(ctx context.Context) (StorageStats, error) {
 
 // matchesFilter checks if a message matches the given filter criteria
 func (ms *MemoryStorage) matchesFilter(message *types.Message, messageID string, filter MessageFilter) bool {
-	// Check sender filter
-	if filter.Sender != "" && message.Sender != filter.Sender {
-		return false
-	}
+	senderSpecified := filter.Sender != ""
+	senderMatches := message.Sender == filter.Sender
 
-	// Check recipients filter
-	if len(filter.Recipients) > 0 {
-		found := false
+	recipientsSpecified := len(filter.Recipients) > 0
+	recipientsMatch := false
+	if recipientsSpecified {
 		for _, filterRecipient := range filter.Recipients {
 			for _, messageRecipient := range message.Recipients {
 				if messageRecipient == filterRecipient {
-					found = true
+					recipientsMatch = true
 					break
 				}
 			}
-			if found {
+			if recipientsMatch {
 				break
 			}
 		}
-		if !found {
-			return false
+	}
+
+	var senderRecipientsMatch bool
+	if filter.Or {
+		// OR semantics: at least one specified side must match; with no
+		// sides specified the filter is unrestricted.
+		if !senderSpecified && !recipientsSpecified {
+			senderRecipientsMatch = true
+		} else {
+			senderRecipientsMatch = (senderSpecified && senderMatches) || (recipientsSpecified && recipientsMatch)
 		}
+	} else {
+		// AND semantics (default): unspecified sides are unrestricted.
+		senderRecipientsMatch = (!senderSpecified || senderMatches) && (!recipientsSpecified || recipientsMatch)
+	}
+	if !senderRecipientsMatch {
+		return false
 	}
 
 	// Check status filter

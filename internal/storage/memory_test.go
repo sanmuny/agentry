@@ -655,6 +655,210 @@ func TestMemoryStorage_ListMessages_FilterWithPagination(t *testing.T) {
 	}
 }
 
+// TestMemoryStorage_ListMessages_OrFilter verifies that a filter with Or set
+// matches messages sent by Sender OR received by any Recipient, and that the
+// merged result is sorted newest-first (mirroring the database backend).
+func TestMemoryStorage_ListMessages_OrFilter(t *testing.T) {
+	storage := NewMemoryStorage(MemoryStorageConfig{})
+	ctx := context.Background()
+
+	agent := "agent@localhost"
+	peer := "peer@localhost"
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+	// Interleave sent and received messages with strictly decreasing
+	// timestamps; message 0 is the newest. An unrelated message between the
+	// peer and a third party must be excluded.
+	seed := []*types.Message{
+		{MessageID: "sent-0", Sender: agent, Recipients: []string{peer}, Timestamp: base.Add(7 * time.Minute)},
+		{MessageID: "recv-1", Sender: peer, Recipients: []string{agent}, Timestamp: base.Add(6 * time.Minute)},
+		{MessageID: "sent-2", Sender: agent, Recipients: []string{peer}, Timestamp: base.Add(5 * time.Minute)},
+		{MessageID: "recv-3", Sender: peer, Recipients: []string{agent}, Timestamp: base.Add(4 * time.Minute)},
+		{MessageID: "sent-4", Sender: agent, Recipients: []string{peer}, Timestamp: base.Add(3 * time.Minute)},
+		{MessageID: "recv-5", Sender: peer, Recipients: []string{agent}, Timestamp: base.Add(2 * time.Minute)},
+		{MessageID: "sent-6", Sender: agent, Recipients: []string{peer}, Timestamp: base.Add(1 * time.Minute)},
+		{MessageID: "recv-7", Sender: peer, Recipients: []string{agent}, Timestamp: base},
+		{MessageID: "other-8", Sender: peer, Recipients: []string{"third@example.com"}, Timestamp: base.Add(8 * time.Minute)},
+	}
+	for _, msg := range seed {
+		if err := storage.StoreMessage(ctx, msg); err != nil {
+			t.Fatalf("store %s: %v", msg.MessageID, err)
+		}
+	}
+
+	// The OR filter must return every message the agent sent or received,
+	// newest-first, and exclude the unrelated message.
+	filter := MessageFilter{Sender: agent, Recipients: []string{agent}, Or: true}
+	result, err := storage.ListMessages(ctx, filter)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	want := []string{"sent-0", "recv-1", "sent-2", "recv-3", "sent-4", "recv-5", "sent-6", "recv-7"}
+	if len(result) != len(want) {
+		t.Fatalf("Expected %d messages, got %d", len(want), len(result))
+	}
+	for i, id := range want {
+		if result[i].MessageID != id {
+			t.Errorf("Position %d: expected %s, got %s", i, id, result[i].MessageID)
+		}
+	}
+
+	// A self-message (sent by the agent to itself) must be matched exactly
+	// once under OR semantics.
+	if err := storage.StoreMessage(ctx, &types.Message{
+		MessageID:  "self-9",
+		Sender:     agent,
+		Recipients: []string{agent},
+		Timestamp:  base.Add(9 * time.Minute),
+	}); err != nil {
+		t.Fatalf("store self-9: %v", err)
+	}
+	result, err = storage.ListMessages(ctx, filter)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if len(result) != len(want)+1 {
+		t.Fatalf("Expected %d messages with self-message, got %d", len(want)+1, len(result))
+	}
+	if result[0].MessageID != "self-9" {
+		t.Errorf("Expected newest message self-9, got %s", result[0].MessageID)
+	}
+}
+
+// TestMemoryStorage_ListMessages_OrFilterPagination verifies that offset and
+// limit apply to the merged OR result set (not to each direction
+// independently), which is the fix for the merged-query pagination bug.
+func TestMemoryStorage_ListMessages_OrFilterPagination(t *testing.T) {
+	storage := NewMemoryStorage(MemoryStorageConfig{})
+	ctx := context.Background()
+
+	agent := "agent@localhost"
+	peer := "peer@localhost"
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+	// Newest-first order: sent-0 .. recv-7.
+	for i := 0; i < 8; i++ {
+		msg := &types.Message{
+			MessageID:  fmt.Sprintf("m-%d", i),
+			Timestamp:  base.Add(time.Duration(7-i) * time.Minute),
+			Recipients: []string{peer},
+		}
+		if i%2 == 0 {
+			msg.Sender = agent
+		} else {
+			msg.Sender = peer
+			msg.Recipients = []string{agent}
+		}
+		if err := storage.StoreMessage(ctx, msg); err != nil {
+			t.Fatalf("store m-%d: %v", i, err)
+		}
+	}
+
+	// offset=1 limit=3 must return the merged rows [m-1, m-2, m-3], proving
+	// that neither direction's rows were skipped independently.
+	filter := MessageFilter{Sender: agent, Recipients: []string{agent}, Or: true, Offset: 1, Limit: 3}
+	result, err := storage.ListMessages(ctx, filter)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	want := []string{"m-1", "m-2", "m-3"}
+	if len(result) != len(want) {
+		t.Fatalf("Expected %d messages, got %d", len(want), len(result))
+	}
+	for i, id := range want {
+		if result[i].MessageID != id {
+			t.Errorf("Position %d: expected %s, got %s", i, id, result[i].MessageID)
+		}
+	}
+
+	// offset=6 limit=3 returns the final two rows; the total across pages
+	// must be exactly 8 unique messages.
+	filter = MessageFilter{Sender: agent, Recipients: []string{agent}, Or: true, Offset: 6, Limit: 3}
+	result, err = storage.ListMessages(ctx, filter)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	want = []string{"m-6", "m-7"}
+	if len(result) != len(want) {
+		t.Fatalf("Expected %d messages, got %d", len(want), len(result))
+	}
+	for i, id := range want {
+		if result[i].MessageID != id {
+			t.Errorf("Position %d: expected %s, got %s", i, id, result[i].MessageID)
+		}
+	}
+
+	// Offset beyond the merged set returns an empty page.
+	filter = MessageFilter{Sender: agent, Recipients: []string{agent}, Or: true, Offset: 8, Limit: 3}
+	result, err = storage.ListMessages(ctx, filter)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if len(result) != 0 {
+		t.Errorf("Expected empty page past the end, got %d messages", len(result))
+	}
+}
+
+// TestMemoryStorage_ListMessages_OrFilterSingleSide verifies that an OR-mode
+// filter with only one side set behaves like the corresponding AND-mode
+// single-predicate query.
+func TestMemoryStorage_ListMessages_OrFilterSingleSide(t *testing.T) {
+	storage := NewMemoryStorage(MemoryStorageConfig{})
+	ctx := context.Background()
+
+	agent := "agent@localhost"
+	peer := "peer@localhost"
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 3; i++ {
+		if err := storage.StoreMessage(ctx, &types.Message{
+			MessageID:  fmt.Sprintf("sent-%d", i),
+			Sender:     agent,
+			Recipients: []string{peer},
+			Timestamp:  base.Add(time.Duration(-i) * time.Minute),
+		}); err != nil {
+			t.Fatalf("store sent-%d: %v", i, err)
+		}
+		if err := storage.StoreMessage(ctx, &types.Message{
+			MessageID:  fmt.Sprintf("recv-%d", i),
+			Sender:     peer,
+			Recipients: []string{agent},
+			Timestamp:  base.Add(time.Duration(-i) * time.Minute),
+		}); err != nil {
+			t.Fatalf("store recv-%d: %v", i, err)
+		}
+	}
+
+	// OR with only a sender must behave like a plain sender query.
+	result, err := storage.ListMessages(ctx, MessageFilter{Sender: agent, Or: true})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if len(result) != 3 {
+		t.Fatalf("Expected 3 sent messages, got %d", len(result))
+	}
+	for _, msg := range result {
+		if msg.Sender != agent {
+			t.Errorf("Expected only sender %s, got %s", agent, msg.Sender)
+		}
+	}
+
+	// OR with only recipients must behave like a plain recipients query.
+	result, err = storage.ListMessages(ctx, MessageFilter{Recipients: []string{agent}, Or: true})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if len(result) != 3 {
+		t.Fatalf("Expected 3 received messages, got %d", len(result))
+	}
+	for _, msg := range result {
+		if msg.Sender == agent {
+			t.Errorf("Expected only received messages, got sent message %s", msg.MessageID)
+		}
+	}
+}
+
 func TestMemoryStorage_GetStats(t *testing.T) {
 	storage := NewMemoryStorage(MemoryStorageConfig{})
 	ctx := context.Background()

@@ -440,9 +440,10 @@ func (s *Server) handleListMessages(c *gin.Context) {
 	}
 
 	// Build the storage filter scoped to the authenticated agent. The
-	// storage layer applies AND semantics between Sender and Recipients,
-	// so "all traffic for an agent" requires two queries (sent + received)
-	// that are merged and de-duplicated below.
+	// storage layer applies AND semantics between Sender and Recipients by
+	// default; the "all traffic" case (no direction) uses OR semantics via
+	// MessageFilter.Or so a single query covers sent + received and
+	// pagination applies to the merged, newest-first result set.
 	filter := storage.MessageFilter{
 		Status: types.DeliveryStatus(status),
 		Limit:  limit,
@@ -470,13 +471,17 @@ func (s *Server) handleListMessages(c *gin.Context) {
 		q.Recipients = []string{recipient}
 		queries = append(queries, q)
 	default:
-		// No direction: everything the agent sent or received.
-		q1 := filter
-		q1.Sender = agentAddr
-		queries = append(queries, q1)
-		q2 := filter
-		q2.Recipients = []string{agentAddr}
-		queries = append(queries, q2)
+		// No direction: everything the agent sent or received. A single
+		// OR-mode query covers both directions so Limit/Offset are applied
+		// to the merged result set. (Previously two queries were paginated
+		// independently and merged, which could return up to 2*limit
+		// messages, overlap or drop rows across offsets, and left the merged
+		// list unsorted.)
+		q := filter
+		q.Sender = agentAddr
+		q.Recipients = []string{agentAddr}
+		q.Or = true
+		queries = append(queries, q)
 	}
 
 	// Run queries, merging results with de-duplication.

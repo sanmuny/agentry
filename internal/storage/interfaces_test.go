@@ -81,6 +81,7 @@ func TestMessageFilter(t *testing.T) {
 		Since:      &since,
 		Limit:      10,
 		Offset:     5,
+		Or:         true,
 	}
 
 	if filter.Sender != "sender@example.com" {
@@ -111,6 +112,10 @@ func TestMessageFilter(t *testing.T) {
 
 	if filter.Offset != 5 {
 		t.Errorf("Expected Offset to be 5, got %d", filter.Offset)
+	}
+
+	if !filter.Or {
+		t.Error("Expected Or to be true")
 	}
 }
 
