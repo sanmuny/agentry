@@ -183,7 +183,7 @@ func (s *Server) handleSendMessage(c *gin.Context) {
 	//   - Shared-DB multi-replica: each replica shares the same storage, so
 	//     ErrWorkflowNotFound does NOT fire — every replica can see and process
 	//     the workflow concurrently (the optimistic-lock protocol in the workflow
-	//     manager serialises conflicting writes).
+	//     manager serializes conflicting writes).
 	//   - MemoryStorage single-process: this is the only process, so
 	//     ErrWorkflowNotFound means the workflow genuinely does not exist.
 	//
